@@ -25,7 +25,7 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.min.js"></script>
+  <script src="https://unpkg.com/@zxing/library@0.19.1/umd/index.min.js"></script>
 
   <script>
     window.storage = {
@@ -82,42 +82,57 @@
       return result;
     }
 
-    // ── Camera QR Scanner ──
+    // ── Camera QR / DataMatrix Scanner (ZXing) ──
     function CameraScanner({ onResult, onClose }) {
       const videoRef = useRef(null);
-      const canvasRef = useRef(null);
-      const streamRef = useRef(null);
-      const rafRef = useRef(null);
+      const readerRef = useRef(null);
       const [status, setStatus] = useState("Kamera başlatılıyor…");
       const [error, setError] = useState(null);
 
       useEffect(() => {
-        let active = true;
-        navigator.mediaDevices?.getUserMedia({ video: { facingMode: "environment" }, audio: false })
-          .then(stream => {
-            if (!active) { stream.getTracks().forEach(t => t.stop()); return; }
-            streamRef.current = stream;
-            if (videoRef.current) { videoRef.current.srcObject = stream; videoRef.current.play(); setStatus("Karekodu kameraya gösterin"); }
-          })
-          .catch(e => setError("Kamera erişimi sağlanamadı: " + e.message));
-        return () => { active = false; streamRef.current?.getTracks().forEach(t => t.stop()); cancelAnimationFrame(rafRef.current); };
-      }, []);
+        let stopped = false;
 
-      useEffect(() => {
-        if (!window.jsQR) return;
-        const scan = () => {
-          const video = videoRef.current, canvas = canvasRef.current;
-          if (video && canvas && video.readyState === video.HAVE_ENOUGH_DATA) {
-            canvas.width = video.videoWidth; canvas.height = video.videoHeight;
-            canvas.getContext("2d").drawImage(video, 0, 0);
-            const id = canvas.getContext("2d").getImageData(0,0,canvas.width,canvas.height);
-            const code = window.jsQR(id.data, id.width, id.height, { inversionAttempts: "dontInvert" });
-            if (code) { onResult(code.data); return; }
+        async function startScanner() {
+          try {
+            const hints = new Map();
+            // Tüm formatları dene: QR, DataMatrix, EAN, vb.
+            const formats = [
+              ZXing.BarcodeFormat.QR_CODE,
+              ZXing.BarcodeFormat.DATA_MATRIX,
+              ZXing.BarcodeFormat.EAN_13,
+              ZXing.BarcodeFormat.EAN_8,
+              ZXing.BarcodeFormat.CODE_128,
+              ZXing.BarcodeFormat.CODE_39,
+            ];
+            hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, formats);
+            hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+
+            const reader = new ZXing.BrowserMultiFormatReader(hints);
+            readerRef.current = reader;
+
+            const devices = await ZXing.BrowserMultiFormatReader.listVideoInputDevices();
+            // Arka kamerayı seç
+            const backCam = devices.find(d => /back|rear|environment/i.test(d.label)) || devices[devices.length - 1];
+            const deviceId = backCam?.deviceId || undefined;
+
+            setStatus("Karekodu kameraya gösterin");
+
+            await reader.decodeFromVideoDevice(deviceId, videoRef.current, (result, err) => {
+              if (stopped) return;
+              if (result) {
+                onResult(result.getText());
+              }
+            });
+          } catch(e) {
+            if (!stopped) setError("Kamera başlatılamadı: " + e.message);
           }
-          rafRef.current = requestAnimationFrame(scan);
+        }
+
+        startScanner();
+        return () => {
+          stopped = true;
+          readerRef.current?.reset();
         };
-        rafRef.current = requestAnimationFrame(scan);
-        return () => cancelAnimationFrame(rafRef.current);
       }, [onResult]);
 
       return (
@@ -135,7 +150,6 @@
             <>
               <div style={{position:"relative",width:"100%",aspectRatio:"1",overflow:"hidden",background:"#000"}}>
                 <video ref={videoRef} style={{width:"100%",height:"100%",objectFit:"cover",display:"block"}} playsInline muted />
-                <canvas ref={canvasRef} style={{display:"none"}} />
                 <div style={{position:"absolute",top:"15%",left:"15%",width:32,height:32,borderTop:"3px solid #6366f1",borderLeft:"3px solid #6366f1",borderRadius:"6px 0 0 0"}}/>
                 <div style={{position:"absolute",top:"15%",right:"15%",width:32,height:32,borderTop:"3px solid #6366f1",borderRight:"3px solid #6366f1",borderRadius:"0 6px 0 0"}}/>
                 <div style={{position:"absolute",bottom:"15%",left:"15%",width:32,height:32,borderBottom:"3px solid #6366f1",borderLeft:"3px solid #6366f1",borderRadius:"0 0 0 6px"}}/>
