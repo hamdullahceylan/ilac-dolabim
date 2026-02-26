@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#1e1b4b" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="İlaç Dolabım" />
+  <title>İlaç Dolabım</title>
+  <link rel="manifest" href="manifest.json" />
+  <link rel="apple-touch-icon" href="icon-192.png" />
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800;900&display=swap');
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body, #root { height: 100%; background: #0f0f1a; }
+    ::-webkit-scrollbar { display: none; }
+    input, select, textarea, button { font-family: 'Nunito', sans-serif; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @keyframes slideUp { from{transform:translateY(40px);opacity:0} to{transform:translateY(0);opacity:1} }
+    @keyframes scanLine { 0%{top:10%} 50%{top:85%} 100%{top:10%} }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.min.js"></script>
+
+  <script>
+    // Simple localStorage-based storage (replaces window.storage)
+    window.storage = {
+      get: async (key) => {
+        const val = localStorage.getItem(key);
+        return val ? { value: val } : null;
+      },
+      set: async (key, value) => {
+        localStorage.setItem(key, value);
+        return { key, value };
+      },
+      delete: async (key) => {
+        localStorage.removeItem(key);
+        return { key, deleted: true };
+      }
+    };
+  </script>
+
+  <script type="text/babel">
+    const { useState, useEffect, useCallback, useRef } = React;
+
+    const CATEGORIES = [
+      { id: "all",         label: "Tümü",           icon: "💊", color: "#6366f1" },
+      { id: "agri-ates",   label: "Ağrı & Ateş",    icon: "🌡️", color: "#ef4444" },
+      { id: "antibiyotik", label: "Antibiyotik",     icon: "🦠", color: "#f59e0b" },
+      { id: "vitamin",     label: "Vitamin",          icon: "✨", color: "#10b981" },
+      { id: "kalp",        label: "Kalp & Tansiyon", icon: "❤️", color: "#ec4899" },
+      { id: "sindirim",    label: "Sindirim",         icon: "🫃", color: "#8b5cf6" },
+      { id: "allerji",     label: "Alerji",           icon: "🌸", color: "#06b6d4" },
+      { id: "diger",       label: "Diğer",            icon: "📦", color: "#64748b" },
+    ];
+
+    const STORAGE_KEY = "medicine-cabinet-v2";
+    const API_KEY = ""; // Buraya Anthropic API anahtarınızı girin
+
+    function getDaysUntilExpiry(dateStr) {
+      if (!dateStr) return null;
+      return Math.ceil((new Date(dateStr) - new Date()) / 86400000);
+    }
+
+    function parseGS1(raw) {
+      const result = {};
+      const aiMap = { "01": "gtin", "17": "expiry", "21": "serial", "10": "batch" };
+      const paren = /\((\d{2})\)([^(]+)/g;
+      let m;
+      while ((m = paren.exec(raw)) !== null) {
+        const key = aiMap[m[1]];
+        if (key) result[key] = m[2].trim();
+      }
+      if (!result.gtin) {
+        const re = /01(\d{14})17(\d{6})(?:21([^\x1d\n]*))?(?:10([^\x1d\n]*))?/;
+        const m2 = re.exec(raw.replace(/\u001d/g, ""));
+        if (m2) {
+          result.gtin = m2[1];
+          result.expiry = m2[2];
+          if (m2[3]) result.serial = m2[3];
+          if (m2[4]) result.batch = m2[4];
+        }
+      }
+      if (!result.gtin) return null;
+      if (result.expiry) {
+        const e = result.expiry;
+        const yy = parseInt(e.slice(0, 2));
+        const yyyy = yy < 50 ? 2000 + yy : 1900 + yy;
+        const mm = e.slice(2, 4);
+        const dd = e.slice(4, 6) === "00" ? "01" : e.slice(4, 6);
+        result.expiryDate = `${yyyy}-${mm}-${dd}`;
+      }
+      return result;
+    }
+
+    async function callClaude(messages, maxTokens = 800) {
+      const key = window._claudeApiKey || API_KEY;
+      if (!key) throw new Error("API_KEY_MISSING");
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" },
+        body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: maxTokens, messages })
+      });
+      const data = await res.json();
+      return data.content?.[0]?.text || "";
+    }
+
+    // ── API Key Setup ──
+    function ApiKeyModal({ onSave }) {
+      const [key, setKey] = useState("");
+      return (
+        <div style={{position:"fixed",inset:0,background:"#0f0f1a",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:24,zIndex:999}}>
+          <div style={{fontSize:52,marginBottom:16}}>💊</div>
+          <div style={{fontSize:22,fontWeight:900,color:"#f1f5f9",marginBottom:8,textAlign:"center"}}>İlaç Dolabım</div>
+          <div style={{fontSize:13,color:"#64748b",marginBottom:32,textAlign:"center",lineHeight:1.7}}>
+            AI özelliklerini kullanmak için<br/>Anthropic API anahtarınızı girin.<br/>
+            <a href="https://console.anthropic.com" target="_blank" style={{color:"#6366f1"}}>console.anthropic.com</a>'dan ücretsiz alabilirsiniz.
+          </div>
+          <input
+            style={{width:"100%",maxWidth:340,background:"#1e1e2e",border:"1px solid rgba(255,255,255,.15)",borderRadius:12,padding:"12px 14px",color:"#f1f5f9",fontSize:15,outline:"none",marginBottom:12}}
+            placeholder="sk-ant-..."
+            value={key}
+            onChange={e => setKey(e.target.value)}
+            type="password"
+          />
+          <button
+            style={{width:"100%",maxWidth:340,background:"linear-gradient(135deg,#6366f1,#8b5cf6)",color:"#fff",border:"none",borderRadius:12,padding:"13px",fontWeight:700,cursor:"pointer",fontSize:16,fontFamily:"Nunito",opacity:key.startsWith("sk-")?1:0.5}}
+            onClick={() => key.startsWith("sk-") && onSave(key)}
+          >
+            Devam Et →
+          </button>
+          <div style={{fontSize:11,color:"#475569",marginTop:16,textAlign:"center",maxWidth:300,lineHeight:1.6}}>
+            Anahtarınız yalnızca bu cihazda saklanır, hiçbir sunucuya gönderilmez.
+          </div>
+        </div>
+      );
+    }
+
+    // ── Camera QR Scanner ──
+    function CameraScanner({ onResult, onClose }) {
+      const videoRef = useRef(null);
+      const canvasRef = useRef(null);
+      const streamRef = useRef(null);
+      const rafRef = useRef(null);
+      const [status, setStatus] = useState("Kamera başlatılıyor…");
+      const [error, setError] = useState(null);
+
+      useEffect(() => {
+        let active = true;
+        navigator.mediaDevices?.getUserMedia({ video: { facingMode: "environment" }, audio: false })
+          .then(stream => {
+            if (!active) { stream.getTracks().forEach(t => t.stop()); return; }
+            streamRef.current = stream;
+            if (videoRef.current) {
+              videoRef.current.srcObject = stream;
+              videoRef.current.play();
+              setStatus("QR / Karekodu kameraya gösterin");
+            }
+          })
+          .catch(e => setError("Kamera erişimi sağlanamadı: " + e.message));
+        return () => { active = false; streamRef.current?.getTracks().forEach(t => t.stop()); cancelAnimationFrame(rafRef.current); };
+      }, []);
+
+      useEffect(() => {
+        if (!window.jsQR) return;
+        const scan = () => {
+          const video = videoRef.current, canvas = canvasRef.current;
+          if (video && canvas && video.readyState === video.HAVE_ENOUGH_DATA) {
+            canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+            canvas.getContext("2d").drawImage(video, 0, 0);
+            const id = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height);
+            const code = window.jsQR(id.data, id.width, id.height, { inversionAttempts: "dontInvert" });
+            if (code) { onResult(code.data); return; }
+          }
+          rafRef.current = requestAnimationFrame(scan);
+        };
+        rafRef.current = requestAnimationFrame(scan);
+        return () => cancelAnimationFrame(rafRef.current);
+      }, [onResult]);
+
+      return (
+        <div style={S.scannerWrap}>
+          <div style={S.scannerHeader}>
+            <span style={{fontWeight:800,fontSize:17}}>📷 Karekod Tara</span>
+            <button style={S.closeBtn2} onClick={onClose}>✕</button>
+          </div>
+          {error ? (
+            <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:16,padding:40}}>
+              <div style={{fontSize:48}}>📵</div>
+              <div style={{textAlign:"center",color:"#94a3b8"}}>{error}</div>
+            </div>
+          ) : (
+            <>
+              <div style={{position:"relative",width:"100%",aspectRatio:"1",overflow:"hidden",background:"#000"}}>
+                <video ref={videoRef} style={S.video} playsInline muted />
+                <canvas ref={canvasRef} style={{display:"none"}} />
+                <div style={{position:"absolute",top:"15%",left:"15%",width:28,height:28,borderTop:"3px solid #6366f1",borderLeft:"3px solid #6366f1",borderRadius:"6px 0 0 0"}} />
+                <div style={{position:"absolute",top:"15%",right:"15%",width:28,height:28,borderTop:"3px solid #6366f1",borderRight:"3px solid #6366f1",borderRadius:"0 6px 0 0"}} />
+                <div style={{position:"absolute",bottom:"15%",left:"15%",width:28,height:28,borderBottom:"3px solid #6366f1",borderLeft:"3px solid #6366f1",borderRadius:"0 0 0 6px"}} />
+                <div style={{position:"absolute",bottom:"15%",right:"15%",width:28,height:28,borderBottom:"3px solid #6366f1",borderRight:"3px solid #6366f1",borderRadius:"0 0 6px 0"}} />
+                <div style={{position:"absolute",left:"15%",right:"15%",height:2,background:"linear-gradient(90deg,transparent,#6366f1,transparent)",animation:"scanLine 2s ease-in-out infinite",top:"10%"}} />
+              </div>
+              <div style={S.scanStatus}>{status}</div>
+              <div style={S.scanHint}>İlaç kutusundaki <strong>DataMatrix / QR</strong> karekoduna doğrultun</div>
+            </>
+          )}
+        </div>
+      );
+    }
+
+    // ── Photo Capture ──
+    function PhotoCapture({ onResult, onClose }) {
+      const videoRef = useRef(null);
+      const canvasRef = useRef(null);
+      const streamRef = useRef(null);
+      const [ready, setReady] = useState(false);
+      const [captured, setCaptured] = useState(null);
+      const [analyzing, setAnalyzing] = useState(false);
+      const [error, setError] = useState(null);
+
+      useEffect(() => {
+        navigator.mediaDevices?.getUserMedia({ video: { facingMode: "environment" }, audio: false })
+          .then(stream => {
+            streamRef.current = stream;
+            if (videoRef.current) { videoRef.current.srcObject = stream; videoRef.current.play(); setReady(true); }
+          })
+          .catch(e => setError("Kamera açılamadı: " + e.message));
+        return () => streamRef.current?.getTracks().forEach(t => t.stop());
+      }, []);
+
+      const capture = () => {
+        const v = videoRef.current, c = canvasRef.current;
+        c.width = v.videoWidth; c.height = v.videoHeight;
+        c.getContext("2d").drawImage(v, 0, 0);
+        setCaptured(c.toDataURL("image/jpeg", 0.8));
+      };
+
+      const analyze = async () => {
+        setAnalyzing(true); setError(null);
+        try {
+          const base64 = captured.split(",")[1];
+          const text = await callClaude([{
+            role: "user",
+            content: [
+              { type: "image", source: { type: "base64", media_type: "image/jpeg", data: base64 } },
+              { type: "text", text: `Bu ilaç kutusunun fotoğrafından bilgileri çıkar. SADECE JSON döndür:\n{"name":"ilaç adı (marka+doz+form)","category":"agri-ates|antibiyotik|vitamin|kalp|sindirim|allerji|diger","expiryDate":"YYYY-MM-DD veya null","description":"1-2 cümle ne için"}\nİlaç kutusu değilse: {"error":"ilaç değil"}` }
+            ]
+          }], 400);
+          const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
+          if (parsed.error) { setError("İlaç kutusu tespit edilemedi."); setAnalyzing(false); return; }
+          onResult(parsed);
+        } catch(e) {
+          setError(e.message === "API_KEY_MISSING" ? "API anahtarı gerekli." : "Analiz başarısız: " + e.message);
+          setAnalyzing(false);
+        }
+      };
+
+      return (
+        <div style={S.scannerWrap}>
+          <div style={S.scannerHeader}>
+            <span style={{fontWeight:800,fontSize:17}}>🤖 AI ile Tanı</span>
+            <button style={S.closeBtn2} onClick={onClose}>✕</button>
+          </div>
+          {error && <div style={S.errorMsg}>{error}</div>}
+          {!captured ? (
+            <>
+              <video ref={videoRef} style={{...S.video,maxHeight:300,background:"#000"}} playsInline muted />
+              <canvas ref={canvasRef} style={{display:"none"}} />
+              <div style={S.scanStatus}>İlaç kutusunu çerçeveleyin</div>
+              <div style={{padding:"8px 16px 16px"}}>
+                <button style={{...S.primaryBtn,width:"100%",opacity:ready?1:0.5}} onClick={capture} disabled={!ready}>📷 Fotoğraf Çek</button>
+              </div>
+            </>
+          ) : (
+            <>
+              <img src={captured} style={{width:"100%",maxHeight:260,objectFit:"cover"}} />
+              {analyzing
+                ? <div style={{display:"flex",alignItems:"center",gap:12,padding:"14px 16px"}}><div style={S.spinner}/><span style={{color:"#a5b4fc",fontWeight:600}}>Analiz ediliyor…</span></div>
+                : <div style={{display:"flex",gap:10,padding:"12px 16px"}}>
+                    <button style={{...S.cancelBtn2,flex:1}} onClick={() => setCaptured(null)}>Tekrar Çek</button>
+                    <button style={{...S.primaryBtn,flex:1}} onClick={analyze}>🤖 Analiz Et</button>
+                  </div>
+              }
+            </>
+          )}
+        </div>
+      );
+    }
+
+    // ── Add Method ──
+    function AddMethodModal({ onQR, onPhoto, onManual, onClose }) {
+      return (
+        <div style={S.overlay} onClick={onClose}>
+          <div style={{...S.modal,animation:"slideUp .25s ease"}} onClick={e=>e.stopPropagation()}>
+            <div style={S.modalHeader}>
+              <span style={S.modalTitle}>İlaç Ekle</span>
+              <button style={S.closeBtn} onClick={onClose}>✕</button>
+            </div>
+            <div style={{display:"flex",flexDirection:"column",gap:12}}>
+              {[
+                {icon:"📷",label:"Karekod Tara",sub:"İlaç kutusundaki DataMatrix / QR kodu okut",fn:onQR,color:"#6366f1"},
+                {icon:"🤖",label:"AI ile Tanı",sub:"Fotoğraf çek, Claude otomatik dolduracak",fn:onPhoto,color:"#8b5cf6"},
+                {icon:"✏️",label:"Manuel Gir",sub:"Bilgileri kendiniz doldurun",fn:onManual,color:"#475569"},
+              ].map(({icon,label,sub,fn,color})=>(
+                <button key={label} onClick={fn} style={{display:"flex",alignItems:"center",gap:14,background:"rgba(255,255,255,.04)",border:`1px solid ${color}55`,borderRadius:14,padding:"14px 16px",cursor:"pointer",textAlign:"left",width:"100%"}}>
+                  <span style={{fontSize:32,flexShrink:0}}>{icon}</span>
+                  <div>
+                    <div style={{color:"#f1f5f9",fontWeight:700,fontSize:15,fontFamily:"Nunito"}}>{label}</div>
+                    <div style={{color:"#64748b",fontSize:12,marginTop:3,fontFamily:"Nunito"}}>{sub}</div>
+                  </div>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ── QR Result ──
+    function QRResultModal({ gs1, onConfirm, onClose }) {
+      const [resolving, setResolving] = useState(true);
+      const [initial, setInitial] = useState({ name:"", category:"diger", stock:"1", expiryDate: gs1.expiryDate||"", description:"" });
+
+      useEffect(() => {
+        (async () => {
+          try {
+            const text = await callClaude([{ role:"user", content:`GTIN: ${gs1.gtin}. Bu Türkiye ilaç GTIN'ine karşılık gelen ilaç adını biliyor musun? SADECE JSON: {"name":"marka+doz+form","category":"agri-ates|antibiyotik|vitamin|kalp|sindirim|allerji|diger","known":true/false}` }], 200);
+            const p = JSON.parse(text.replace(/```json|```/g,"").trim());
+            if (p.name) setInitial(prev => ({...prev, name:p.name, category:p.category||"diger"}));
+          } catch {}
+          setResolving(false);
+        })();
+      }, [gs1.gtin]);
+
+      if (resolving) return (
+        <div style={S.overlay}>
+          <div style={{...S.modal,alignItems:"center",display:"flex",flexDirection:"column",gap:16,padding:40}}>
+            <div style={S.spinner}/><span style={{color:"#94a3b8"}}>İlaç adı çözümleniyor…</span>
+          </div>
+        </div>
+      );
+
+      return (
+        <Modal title="✅ Karekod Okundu" onClose={onClose}>
+          <div style={{background:"#0f0f1a",borderRadius:10,padding:"10px 14px",fontSize:13,color:"#94a3b8",marginBottom:16,lineHeight:2}}>
+            <div><span style={{color:"#6366f1",fontWeight:700}}>GTIN: </span>{gs1.gtin}</div>
+            {gs1.expiryDate && <div><span style={{color:"#6366f1",fontWeight:700}}>SKT: </span>{gs1.expiryDate}</div>}
+            {gs1.serial && <div><span style={{color:"#6366f1",fontWeight:700}}>Seri: </span>{gs1.serial}</div>}
+          </div>
+          <MedicineForm initial={initial} onSave={onConfirm} onClose={onClose} />
+        </Modal>
+      );
+    }
+
+    // ── Modal ──
+    function Modal({ title, onClose, children }) {
+      return (
+        <div style={S.overlay} onClick={onClose}>
+          <div style={{...S.modal,animation:"slideUp .25s ease"}} onClick={e=>e.stopPropagation()}>
+            <div style={S.modalHeader}>
+              <span style={S.modalTitle}>{title}</span>
+              <button style={S.closeBtn} onClick={onClose}>✕</button>
+            </div>
+            {children}
+          </div>
+        </div>
+      );
+    }
+
+    // ── Medicine Form ──
+    function MedicineForm({ initial, onSave, onClose }) {
+      const [form, setForm] = useState(initial || {name:"",category:"diger",stock:"",expiryDate:"",description:""});
+      const set = (k,v) => setForm(f=>({...f,[k]:v}));
+      return (
+        <div style={{display:"flex",flexDirection:"column",gap:14}}>
+          <div><label style={S.label}>İlaç Adı *</label><input style={S.input} value={form.name} onChange={e=>set("name",e.target.value)} placeholder="Örn: Parol 500mg Tablet"/></div>
+          <div><label style={S.label}>Kategori</label>
+            <select style={S.input} value={form.category} onChange={e=>set("category",e.target.value)}>
+              {CATEGORIES.filter(c=>c.id!=="all").map(c=><option key={c.id} value={c.id}>{c.icon} {c.label}</option>)}
+            </select>
+          </div>
+          <div><label style={S.label}>Stok (adet)</label><input style={S.input} type="number" min="0" value={form.stock} onChange={e=>set("stock",e.target.value)} placeholder="0"/></div>
+          <div><label style={S.label}>Son Kullanma Tarihi</label><input style={S.input} type="date" value={form.expiryDate} onChange={e=>set("expiryDate",e.target.value)}/></div>
+          <div><label style={S.label}>Not</label><textarea style={{...S.input,height:70,resize:"vertical"}} value={form.description} onChange={e=>set("description",e.target.value)} placeholder="İsteğe bağlı…"/></div>
+          <div style={{display:"flex",gap:10}}>
+            <button style={{...S.cancelBtn2,flex:1}} onClick={onClose}>İptal</button>
+            <button style={{...S.primaryBtn,flex:1}} onClick={()=>form.name.trim()&&onSave(form)}>{initial?.name?"Güncelle":"Kaydet"}</button>
+          </div>
+        </div>
+      );
+    }
+
+    // ── Expiry Badge ──
+    function ExpiryBadge({ days }) {
+      if (days===null) return null;
+      if (days<0)   return <span style={S.badge.expired}>Süresi Dolmuş</span>;
+      if (days<=30) return <span style={S.badge.soon}>{days}g kaldı</span>;
+      if (days<=90) return <span style={S.badge.warn}>{days}g kaldı</span>;
+      return null;
+    }
+
+    // ── Medicine Card ──
+    function MedicineCard({ med, onEdit, onDelete, onAI }) {
+      const days = getDaysUntilExpiry(med.expiryDate);
+      const cat = CATEGORIES.find(c=>c.id===med.category)||CATEGORIES[7];
+      return (
+        <div style={{...S.card,borderLeft:`4px solid ${cat.color}`,opacity:days!==null&&days<0?0.65:1}}>
+          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:8}}>
+            <span style={{fontSize:26}}>{cat.icon}</span>
+            <div style={{flex:1}}>
+              <div style={{fontSize:16,fontWeight:700,color:"#f1f5f9"}}>{med.name}</div>
+              <div style={{fontSize:12,color:"#94a3b8",marginTop:2}}>{cat.label}</div>
+            </div>
+            <div style={{display:"flex",gap:2}}>
+              <button style={S.iconBtn} onClick={()=>onEdit(med)}>✏️</button>
+              <button style={S.iconBtn} onClick={()=>onDelete(med.id)}>🗑️</button>
+            </div>
+          </div>
+          <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:8,alignItems:"center"}}>
+            {med.stock!==undefined&&<span style={S.chip}>📦 {med.stock} adet</span>}
+            {med.expiryDate&&<span style={S.chip}>📅 {med.expiryDate}</span>}
+            <ExpiryBadge days={days}/>
+          </div>
+          {med.description&&<div style={{fontSize:13,color:"#64748b",marginBottom:8,lineHeight:1.5}}>{med.description}</div>}
+          <button style={S.aiBtn} onClick={()=>onAI(med)}>🤖 Ne işe yarar?</button>
+        </div>
+      );
+    }
+
+    // ── AI Info ──
+    function AIInfoPanel({ med, onClose }) {
+      const [info, setInfo] = useState("");
+      const [loading, setLoading] = useState(true);
+      useEffect(()=>{
+        (async()=>{
+          try {
+            const text = await callClaude([{role:"user",content:`"${med.name}" ilacı hakkında Türkçe kısa bilgi ver. 1) Ne işe yarar, 2) Nasıl kullanılır, 3) Önemli uyarılar. 200-300 kelime, sade.`}]);
+            setInfo(text);
+          } catch(e) { setInfo(e.message==="API_KEY_MISSING"?"API anahtarı gerekli.":"Bir hata oluştu."); }
+          setLoading(false);
+        })();
+      },[med.name]);
+      return (
+        <Modal title={`🤖 ${med.name}`} onClose={onClose}>
+          {loading
+            ? <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:14,padding:40,color:"#94a3b8"}}><div style={S.spinner}/><span>Yükleniyor…</span></div>
+            : <div style={{fontSize:14,lineHeight:1.8,color:"#cbd5e1",whiteSpace:"pre-wrap"}}>{info}</div>
+          }
+        </Modal>
+      );
+    }
+
+    // ── Main App ──
+    function App() {
+      const [apiKey, setApiKey] = useState(() => localStorage.getItem("claude-api-key") || "");
+      const [meds, setMeds] = useState([]);
+      const [filter, setFilter] = useState("all");
+      const [search, setSearch] = useState("");
+      const [sortBy, setSortBy] = useState("name");
+      const [mode, setMode] = useState(null);
+      const [editMed, setEditMed] = useState(null);
+      const [aiMed, setAiMed] = useState(null);
+      const [qrGs1, setQrGs1] = useState(null);
+      const [prefilledForm, setPrefilledForm] = useState(null);
+
+      useEffect(()=>{
+        if (apiKey) { window._claudeApiKey = apiKey; localStorage.setItem("claude-api-key", apiKey); }
+      },[apiKey]);
+
+      useEffect(()=>{
+        (async()=>{ try { const r=await window.storage.get(STORAGE_KEY); if(r?.value) setMeds(JSON.parse(r.value)); } catch{} })();
+      },[]);
+
+      const persist = useCallback(async(data)=>{ try { await window.storage.set(STORAGE_KEY, JSON.stringify(data)); } catch{} },[]);
+
+      const addMed = (form) => { const m={...form,id:Date.now().toString(),stock:Number(form.stock)||0}; const u=[...meds,m]; setMeds(u); persist(u); closeAll(); };
+      const updateMed = (form) => { const u=meds.map(m=>m.id===editMed.id?{...editMed,...form,stock:Number(form.stock)||0}:m); setMeds(u); persist(u); closeAll(); };
+      const deleteMed = (id) => { if(!confirm("Silmek istiyor musunuz?")) return; const u=meds.filter(m=>m.id!==id); setMeds(u); persist(u); };
+      const closeAll = () => { setMode(null); setEditMed(null); setAiMed(null); setQrGs1(null); setPrefilledForm(null); };
+
+      const handleQR = useCallback((raw) => {
+        const gs1 = parseGS1(raw);
+        if (gs1) { setQrGs1(gs1); setMode("qrResult"); }
+        else { setPrefilledForm({name:raw.slice(0,80),category:"diger",stock:"1",expiryDate:"",description:""}); setMode("form"); }
+      },[]);
+
+      const handlePhotoResult = useCallback((parsed) => {
+        setPrefilledForm({...parsed,stock:"1",expiryDate:parsed.expiryDate||""});
+        setMode("form");
+      },[]);
+
+      if (!apiKey) return <ApiKeyModal onSave={setApiKey} />;
+
+      const filtered = meds
+        .filter(m=>filter==="all"||m.category===filter)
+        .filter(m=>m.name.toLowerCase().includes(search.toLowerCase()))
+        .sort((a,b)=>{
+          if(sortBy==="name") return a.name.localeCompare(b.name,"tr");
+          if(sortBy==="expiry") return (getDaysUntilExpiry(a.expiryDate)??9999)-(getDaysUntilExpiry(b.expiryDate)??9999);
+          if(sortBy==="stock") return (a.stock||0)-(b.stock||0);
+          return 0;
+        });
+
+      const expiringSoon = meds.filter(m=>{ const d=getDaysUntilExpiry(m.expiryDate); return d!==null&&d<=30; });
+
+      return (
+        <div style={S.app}>
+          <div style={S.header}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:12}}>
+              <div>
+                <div style={{fontSize:24,fontWeight:800}}>💊 İlaç Dolabım</div>
+                <div style={{fontSize:12,color:"#a5b4fc",marginTop:2}}>{meds.length} ilaç kayıtlı</div>
+              </div>
+              <button style={S.addBtn} onClick={()=>setMode("choose")}>+ Ekle</button>
+            </div>
+            {expiringSoon.length>0&&(
+              <div style={{background:"rgba(239,68,68,.15)",border:"1px solid rgba(239,68,68,.3)",borderRadius:10,padding:"8px 12px",fontSize:13,color:"#fca5a5",marginBottom:10}}>
+                ⚠️ {expiringSoon.length} ilacın son kullanma tarihi yaklaşıyor!
+              </div>
+            )}
+            <input style={S.search} placeholder="🔍 İlaç ara…" value={search} onChange={e=>setSearch(e.target.value)}/>
+            <div style={{display:"flex",alignItems:"center",gap:6,paddingBottom:14}}>
+              <span style={{fontSize:12,color:"#a5b4fc"}}>Sırala:</span>
+              {[["name","İsim"],["expiry","SKT"],["stock","Stok"]].map(([v,l])=>(
+                <button key={v} style={{background:sortBy===v?"#6366f1":"rgba(255,255,255,.08)",border:"none",color:sortBy===v?"#fff":"#c7d2fe",borderRadius:8,padding:"4px 10px",fontSize:12,cursor:"pointer",fontFamily:"Nunito"}} onClick={()=>setSortBy(v)}>{l}</button>
+              ))}
+            </div>
+          </div>
+
+          <div style={{display:"flex",gap:8,overflowX:"auto",padding:"12px 16px",scrollbarWidth:"none"}}>
+            {CATEGORIES.map(c=>{
+              const count=c.id==="all"?meds.length:meds.filter(m=>m.category===c.id).length;
+              return <button key={c.id} style={{whiteSpace:"nowrap",background:filter===c.id?c.color:"rgba(255,255,255,.06)",border:"1px solid rgba(255,255,255,.1)",color:filter===c.id?"#fff":"#c7d2fe",borderRadius:20,padding:"6px 14px",fontSize:13,cursor:"pointer",fontFamily:"Nunito"}} onClick={()=>setFilter(c.id)}>{c.icon} {c.label}{count>0?` ${count}`:""}</button>;
+            })}
+          </div>
+
+          <div style={{padding:"12px 16px",display:"flex",flexDirection:"column",gap:12}}>
+            {filtered.length===0
+              ? <div style={{textAlign:"center",color:"#64748b",padding:60,fontSize:16}}>{meds.length===0?"İlk ilacınızı ekleyin! 💊":"Sonuç bulunamadı."}</div>
+              : filtered.map(m=><MedicineCard key={m.id} med={m} onEdit={med=>{setEditMed(med);setMode("edit");}} onDelete={deleteMed} onAI={med=>{setAiMed(med);setMode("ai");}}/>)
+            }
+          </div>
+
+          {mode==="choose"&&<AddMethodModal onQR={()=>setMode("qr")} onPhoto={()=>setMode("photo")} onManual={()=>{setPrefilledForm(null);setMode("form");}} onClose={closeAll}/>}
+          {mode==="qr"&&<div style={S.overlay}><CameraScanner onResult={handleQR} onClose={()=>setMode("choose")}/></div>}
+          {mode==="photo"&&<div style={S.overlay}><PhotoCapture onResult={handlePhotoResult} onClose={()=>setMode("choose")}/></div>}
+          {mode==="form"&&<Modal title="Yeni İlaç Ekle" onClose={closeAll}><MedicineForm initial={prefilledForm} onSave={addMed} onClose={closeAll}/></Modal>}
+          {mode==="edit"&&editMed&&<Modal title="İlacı Düzenle" onClose={closeAll}><MedicineForm initial={editMed} onSave={updateMed} onClose={closeAll}/></Modal>}
+          {mode==="qrResult"&&qrGs1&&<QRResultModal gs1={qrGs1} onConfirm={addMed} onClose={closeAll}/>}
+          {mode==="ai"&&aiMed&&<AIInfoPanel med={aiMed} onClose={closeAll}/>}
+        </div>
+      );
+    }
+
+    const S = {
+      app:{minHeight:"100vh",backgroundColor:"#0f0f1a",color:"#e2e8f0",fontFamily:"'Nunito',sans-serif",paddingBottom:40},
+      header:{background:"linear-gradient(135deg,#1e1b4b,#312e81)",padding:"20px 16px 0",position:"sticky",top:0,zIndex:10,boxShadow:"0 4px 20px rgba(0,0,0,.4)"},
+      addBtn:{background:"linear-gradient(135deg,#6366f1,#8b5cf6)",color:"#fff",border:"none",borderRadius:12,padding:"10px 18px",fontWeight:700,cursor:"pointer",fontSize:15,fontFamily:"Nunito"},
+      search:{width:"100%",background:"rgba(255,255,255,.1)",border:"1px solid rgba(255,255,255,.15)",borderRadius:12,padding:"10px 14px",color:"#fff",fontSize:15,outline:"none",marginBottom:10},
+      card:{background:"#1e1e2e",borderRadius:16,padding:"14px 14px 10px",boxShadow:"0 2px 12px rgba(0,0,0,.3)"},
+      chip:{background:"rgba(255,255,255,.07)",borderRadius:8,padding:"3px 8px",fontSize:12,color:"#94a3b8"},
+      aiBtn:{background:"rgba(99,102,241,.15)",border:"1px solid rgba(99,102,241,.3)",color:"#a5b4fc",borderRadius:10,padding:"6px 14px",fontSize:13,cursor:"pointer",width:"100%",fontFamily:"Nunito"},
+      iconBtn:{background:"none",border:"none",cursor:"pointer",fontSize:18,padding:4,borderRadius:8},
+      badge:{
+        expired:{background:"rgba(239,68,68,.2)",color:"#fca5a5",borderRadius:8,padding:"2px 8px",fontSize:11,fontWeight:700},
+        soon:{background:"rgba(245,158,11,.2)",color:"#fde68a",borderRadius:8,padding:"2px 8px",fontSize:11,fontWeight:700},
+        warn:{background:"rgba(16,185,129,.15)",color:"#6ee7b7",borderRadius:8,padding:"2px 8px",fontSize:11,fontWeight:700},
+      },
+      overlay:{position:"fixed",inset:0,background:"rgba(0,0,0,.75)",backdropFilter:"blur(4px)",zIndex:100,display:"flex",alignItems:"flex-end",justifyContent:"center"},
+      modal:{background:"#1e1e2e",borderRadius:"20px 20px 0 0",padding:20,width:"100%",maxWidth:480,maxHeight:"92vh",overflowY:"auto"},
+      modalHeader:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20},
+      modalTitle:{fontSize:18,fontWeight:800},
+      closeBtn:{background:"rgba(255,255,255,.1)",border:"none",color:"#fff",borderRadius:8,padding:"4px 10px",cursor:"pointer",fontSize:16},
+      label:{display:"block",fontSize:13,color:"#94a3b8",marginBottom:6,fontWeight:600},
+      input:{width:"100%",background:"#0f0f1a",border:"1px solid rgba(255,255,255,.1)",borderRadius:10,padding:"10px 12px",color:"#f1f5f9",fontSize:15,outline:"none"},
+      primaryBtn:{background:"linear-gradient(135deg,#6366f1,#8b5cf6)",color:"#fff",border:"none",borderRadius:12,padding:12,fontWeight:700,cursor:"pointer",fontSize:15,fontFamily:"Nunito"},
+      cancelBtn2:{background:"rgba(255,255,255,.08)",color:"#94a3b8",border:"none",borderRadius:12,padding:12,fontWeight:600,cursor:"pointer",fontSize:15,fontFamily:"Nunito"},
+      spinner:{width:32,height:32,border:"3px solid rgba(99,102,241,.3)",borderTop:"3px solid #6366f1",borderRadius:"50%",animation:"spin 0.8s linear infinite"},
+      scannerWrap:{background:"#0f0f1a",borderRadius:"20px 20px 0 0",width:"100%",maxWidth:480,maxHeight:"92vh",overflowY:"auto"},
+      scannerHeader:{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"16px 16px 12px"},
+      video:{width:"100%",objectFit:"cover",display:"block",background:"#000"},
+      scanStatus:{padding:"12px 16px 4px",textAlign:"center",fontWeight:700,fontSize:15,color:"#a5b4fc"},
+      scanHint:{padding:"4px 16px 16px",textAlign:"center",fontSize:12,color:"#64748b"},
+      errorMsg:{background:"rgba(239,68,68,.15)",color:"#fca5a5",borderRadius:10,padding:"8px 12px",margin:"0 16px 8px",fontSize:13},
+      closeBtn2:{background:"rgba(255,255,255,.1)",border:"none",color:"#fff",borderRadius:8,padding:"6px 14px",cursor:"pointer",fontWeight:700,fontFamily:"Nunito"},
+    };
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
